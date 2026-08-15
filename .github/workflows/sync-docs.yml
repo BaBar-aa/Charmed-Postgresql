@@ -1,12 +1,43 @@
 ﻿name: sync-docs
 
 on:
+  schedule:
+    - cron: "0 3 * * 1"
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: List branches
+      - uses: actions/checkout@v5
+
+      - name: Pull upstream 16/edge
         run: |
-          git ls-remote --heads https://github.com/canonical/postgresql-operator
+          set -e
+          rm -rf /tmp/pgop docs-source
+          git clone --depth 1 --branch 16/edge https://github.com/canonical/postgresql-operator /tmp/pgop
+          mkdir -p docs-source
+          for item in docs src templates config.yaml actions.yaml metadata.yaml charmcraft.yaml LICENSE AGENTS.md; do
+            if [ -e "/tmp/pgop/$item" ]; then
+              cp -r "/tmp/pgop/$item" docs-source/
+              echo "copied: $item"
+            else
+              echo "missing: $item"
+            fi
+          done
+          cp /tmp/pgop/README.md docs-source/upstream-README.md
+          rm -rf /tmp/pgop
+          echo "===== RESULT ====="
+          ls -la docs-source
+
+      - name: Commit if changed
+        run: |
+          git config user.name  github-actions
+          git config user.email actions@github.com
+          git add -A
+          git diff --cached --quiet && echo "no changes" && exit 0
+          git commit -m "chore: sync upstream 16/edge"
+          git push
