@@ -1,38 +1,16 @@
 ﻿name: sync-docs
 
 on:
-  schedule:
-    - cron: "0 3 * * 1"
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Pull upstream docs
+      - name: Inspect upstream
         run: |
-          set -e
-          rm -rf /tmp/pgop docs-source
           git clone --depth 1 https://github.com/canonical/postgresql-operator /tmp/pgop
-          mkdir -p docs-source
-          cp -r /tmp/pgop/docs docs-source/
-          cp -r /tmp/pgop/src docs-source/
-          cp /tmp/pgop/config.yaml docs-source/
-          cp /tmp/pgop/actions.yaml docs-source/
-          cp /tmp/pgop/metadata.yaml docs-source/
-          rm -rf /tmp/pgop
-          ls -la docs-source
-
-      - name: Commit if changed
-        run: |
-          git config user.name  github-actions
-          git config user.email actions@github.com
-          git add -A
-          git diff --cached --quiet && echo "no changes" && exit 0
-          git commit -m "chore: sync upstream docs"
-          git push
+          echo "===== ROOT ====="
+          ls -la /tmp/pgop
+          echo "===== BRANCH ====="
+          cd /tmp/pgop && git branch -a
