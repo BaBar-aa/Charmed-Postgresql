@@ -7,10 +7,6 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Inspect upstream
+      - name: List branches
         run: |
-          git clone --depth 1 https://github.com/canonical/postgresql-operator /tmp/pgop
-          echo "===== ROOT ====="
-          ls -la /tmp/pgop
-          echo "===== BRANCH ====="
-          cd /tmp/pgop && git branch -a
+          git ls-remote --heads https://github.com/canonical/postgresql-operator
