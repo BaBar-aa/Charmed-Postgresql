@@ -116,6 +116,7 @@ from single_kernel_postgresql.config.literals import (
 from single_kernel_postgresql.core.config import CharmConfig
 from single_kernel_postgresql.core.state import CharmState
 from single_kernel_postgresql.events.database import DatabaseEventsHandler
+from single_kernel_postgresql.events.ldap import LDAP
 from single_kernel_postgresql.events.tls import TLS
 from single_kernel_postgresql.events.tls_transfer import TLSTransfer
 from single_kernel_postgresql.lib.charms.data_platform_libs.v0.data_interfaces import (
@@ -163,7 +164,6 @@ from constants import (
     TEMP_STORAGE_PATH,
     UPDATE_CERTS_BIN_PATH,
 )
-from ldap import PostgreSQLLDAP
 from relations.async_replication import PostgreSQLAsyncReplication
 from relations.watcher import PostgreSQLWatcherRelation
 from rotate_logs import RotateLogs
@@ -418,7 +418,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         self._storage_path = self.meta.storages["data"].location
 
         self.backup = PostgreSQLBackups(self, "s3-parameters")
-        self.ldap = PostgreSQLLDAP(self, "ldap")
+        self.ldap = LDAP(self, self.state)
         # TLS events handler owns the two cert requirers; build it before the TLS
         # manager so the manager can constructor-inject them for its live-fetch getters.
         self.tls = TLS(self, self.state)
@@ -443,6 +443,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             tls_manager=self.tls_manager,
             patroni_manager=self.patroni_manager,
             database_manager=self.database_manager,
+            ldap_handler=self.ldap,
             resource_provider=self.get_resource_provider,
             request_restart=self.request_restart,
             restart_services=self.restart_services,
@@ -1565,6 +1566,21 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
                 hosts.append(unit.name.replace("/", "-"))
         return set(hosts)
 
+    @property
+    def _planned_units(self) -> int:
+        """Number of planned units, resilient to a transient goal-state failure.
+
+        ops implements ``Application.planned_units()`` via ``goal-state``, which fails
+        ("saas application ... not found") while a cross-model SAAS force-removed during a
+        dead-DC teardown still lingers in goal-state. Fall back to the count of currently known
+        units so the hook reconciles instead of crashing the ``_patroni`` property and every
+        hook that touches it (DPE-10203).
+        """
+        try:
+            return self.app.planned_units()
+        except ModelError:
+            return len(self._hosts)
+
     @cached_property
     def _patroni(self) -> Patroni:
         """Returns an instance of the Patroni object."""
@@ -2103,7 +2119,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             cache = snap.SnapCache()
             postgres_snap = cache[charm_refresh.snap_name()]
 
-        ldap_params = self.get_ldap_parameters()
+        ldap_params = self.ldap.get_ldap_parameters()
         ldap_url = urlparse(ldap_params["ldapurl"])
         ldap_host = ldap_url.hostname
         ldap_port = ldap_url.port
@@ -2375,6 +2391,11 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         # Update the sync-standby endpoint in the async replication data.
         self.async_replication.update_async_replication_data()
 
+        # Clear a promoted-cluster-counter orphaned by a dead-DC teardown whose relation-broken
+        # never fired (Juju CMR limitation); otherwise a newly-formed async relation re-counts it
+        # and create-replication wrongly reports "There is already a replication set up.".
+        self.async_replication.clear_stale_promotion()
+
         self.backup.coordinate_stanza_fields()
 
         # self.logical_replication.retry_validations()
@@ -2540,10 +2561,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
                 danger_state = ""
                 if not self._patroni.has_raft_quorum():
                     danger_state = " (read-only)"
-                elif (
-                    len(self.patroni_manager.get_running_cluster_members())
-                    < self.app.planned_units()
-                ):
+                elif len(self.patroni_manager.get_running_cluster_members()) < self._planned_units:
                     danger_state = " (degraded)"
                 unit_status = "Standby" if self.is_standby_leader else "Primary"
                 self.set_unit_status(ActiveStatus(f"{unit_status}{danger_state}"))
@@ -2771,12 +2789,12 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         """Updates Patroni config file based on the existence of the TLS files."""
         if refresh is None:
             refresh = self.refresh
-        return self.config_manager.update_config(
+        primary_cluster_endpoint = self.async_replication.get_primary_cluster_endpoint()
+        result = self.config_manager.update_config(
             self.postgresql,
             is_creating_backup=is_creating_backup,
             relations_user_databases_map=self.relations_user_databases_map,
-            ldap_parameters=self.get_ldap_parameters(),
-            async_primary_cluster_endpoint=self.async_replication.get_primary_cluster_endpoint(),
+            async_primary_cluster_endpoint=primary_cluster_endpoint,
             async_partner_addresses=self.async_replication.get_partner_addresses(),
             async_standby_endpoints=self.async_replication.get_standby_endpoints(),
             watcher_raft_address=self.watcher_offer.watcher_raft_address
@@ -2785,6 +2803,21 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             no_peers=no_peers,
             refresh=refresh,
         )
+        # The lib's apply_api_config only SETS the DCS standby_cluster (when another
+        # cluster is primary) and never CLEARS it. A force-promote bumps the
+        # promoted-cluster-counter but — while the dead-DC relation still lingers — does
+        # not call promote_standby_cluster(), so without this the reconciler never clears
+        # the stale standby and the cluster stays a read-only standby leader (DPE-10203).
+        if (
+            result
+            and not no_peers
+            and self.patroni_manager.member_started
+            and primary_cluster_endpoint is None
+        ):
+            self.patroni_manager.bulk_update_parameters_controller_by_patroni(
+                {}, {"standby_cluster": None}
+            )
+        return result
 
     def _validate_config_options(self) -> None:
         """Validates specific config options that need access to the database or to the TLS status."""
@@ -3033,32 +3066,6 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             for ext in SPI_MODULE:
                 plugins.append(ext)
         return plugins
-
-    def get_ldap_parameters(self) -> dict:
-        """Returns the LDAP configuration to use."""
-        if not self.is_cluster_initialised:
-            return {}
-        if not self.is_ldap_charm_related:
-            logger.debug("LDAP is not enabled")
-            return {}
-
-        data = self.ldap.get_relation_data()
-        if data is None:
-            return {}
-
-        params = {
-            "ldapbasedn": data.base_dn,
-            "ldapbinddn": data.bind_dn,
-            "ldapbindpasswd": data.bind_password,
-            "ldaptls": data.starttls,
-            "ldapurl": data.urls[0],
-            # LDAP authentication parameters that are exclusive to
-            # one of the two supported modes (simple bind or search+bind)
-            # must be put at the very end of the parameters string
-            "ldapsearchfilter": self.config.ldap_search_filter,
-        }
-
-        return params
 
 
 if __name__ == "__main__":
