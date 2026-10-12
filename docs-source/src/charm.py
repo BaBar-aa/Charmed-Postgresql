@@ -114,15 +114,18 @@ from single_kernel_postgresql.config.literals import (
 )
 from single_kernel_postgresql.core.config import CharmConfig
 from single_kernel_postgresql.core.state import CharmState
+from single_kernel_postgresql.events.async_replication import PostgreSQLAsyncReplication
 from single_kernel_postgresql.events.backup import BackupEventsHandler
 from single_kernel_postgresql.events.database import DatabaseEventsHandler
 from single_kernel_postgresql.events.ldap import LDAP
 from single_kernel_postgresql.events.tls import TLS
 from single_kernel_postgresql.events.tls_transfer import TLSTransfer
+from single_kernel_postgresql.events.watcher import WatcherEventsHandler
 from single_kernel_postgresql.lib.charms.data_platform_libs.v0.data_interfaces import (
     DatabaseProvides,
 )
 from single_kernel_postgresql.lib.charms.data_platform_libs.v0.s3 import S3Requirer
+from single_kernel_postgresql.managers.async_replication import AsyncReplicationManager
 from single_kernel_postgresql.managers.backup import BackupManager
 from single_kernel_postgresql.managers.cluster import ClusterManager
 from single_kernel_postgresql.managers.config import ConfigManager
@@ -173,8 +176,6 @@ from constants import (
     UPDATE_CERTS_BIN_PATH,
 )
 from oom import ensure_snap_oom_protection
-from relations.async_replication import PostgreSQLAsyncReplication
-from relations.watcher import PostgreSQLWatcherRelation
 from rotate_logs import RotateLogs
 
 logger = logging.getLogger(__name__)
@@ -384,6 +385,8 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
 
         # TODO switch to the abstract class base
         # State
+        # ops permits only one S3Requirer object per charm for the s3-parameters relation;
+        # build it here (before CharmState) and hand the same instance to the backups manager.
         self.s3_requirer = S3Requirer(self, S3_RELATION_NAME)
         self.state = CharmState(
             charm=self,
@@ -425,6 +428,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             self.framework.observe(
                 self.on[storage_name].storage_detaching, self._on_storage_detaching
             )
+        self.framework.observe(self.on.remove, self._on_remove)
         self.cluster_name = self.app.name
         self._member_name = self.unit.name.replace("/", "-")
         self._certs_path = "/usr/local/share/ca-certificates"
@@ -492,8 +496,32 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         # never triggers a reload against files that were never written.
         self.framework.observe(self.tls.tls_files_pushed, self._reload_tls_after_push)
         self.tls_transfer = TLSTransfer(self, PEER_RELATION)
-        self.async_replication = PostgreSQLAsyncReplication(self)
-        self.watcher_offer = PostgreSQLWatcherRelation(self)
+        self.watcher_handler = WatcherEventsHandler(self, self.workload, self.state)
+        self.async_replication_manager = AsyncReplicationManager(
+            state=self.state,
+            workload=self.workload,
+            patroni_manager=self.patroni_manager,
+            update_config=self.update_config,
+            set_unit_status=self.set_unit_status,
+            set_primary_status_message=self.set_primary_status_message,
+            set_app_status=lambda: self.async_replication.set_app_status(),
+            # K8s-only bridges: on VM the pgdata re-initialisation goes through
+            # _reinitialise_pgdata (workload seam) and there is no leader annotation.
+            create_pgdata=lambda: None,
+            fix_leader_annotation=lambda: True,
+            re_emit_relation_changed=lambda: (
+                self.async_replication._re_emit_async_relation_changed_event()
+            ),
+            watcher=self.watcher_handler,
+        )
+        self.async_replication = PostgreSQLAsyncReplication(
+            self,
+            self.state,
+            self.async_replication_manager,
+            self.patroni_manager,
+            self.workload,
+            watcher=self.watcher_handler,
+        )
         # self.logical_replication = PostgreSQLLogicalReplication(self)
         self.restart_manager = RollingOpsManager(
             charm=self, relation="restart", callback=self._restart
@@ -626,7 +654,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         self._setup_exporter()
         self.backup.start_stop_pgbackrest_service()
         self._setup_pgbackrest_exporter()
-        self.watcher_offer.update_unit_address()
+        self.watcher_handler.update_unit_address()
 
         # Wait until the database initialise.
         self.set_unit_status(WaitingStatus("waiting for database initialisation"), refresh=refresh)
@@ -675,6 +703,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         """Set unit status without overriding higher priority refresh status."""
         if refresh is None:
             refresh = self.refresh
+
         if refresh is not None and refresh.unit_status_higher_priority:
             return
         if (
@@ -688,6 +717,24 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             )
             return
         self.unit.status = status
+
+    def set_app_status(self, status: ops.StatusBase) -> None:
+        """Set the application status without overriding a higher-priority refresh status.
+
+        Bridge for the single-kernel async-replication handler, which writes the app
+        status through the charm instead of touching ``self.app.status`` directly.
+        """
+        if self.refresh is not None and self.refresh.app_status_higher_priority:
+            self.app.status = self.refresh.app_status_higher_priority
+            return
+        self.app.status = status
+
+    def set_primary_status_message(self) -> None:
+        """Recompute the unit's primary/standby status message.
+
+        Bridge for the single-kernel async-replication handler (DPE-10203).
+        """
+        self._set_primary_status_message()
 
     def _restore_unit_status(self, status: ops.StatusBase) -> None:
         """Restore a previously cached unit status.
@@ -1279,8 +1326,8 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
                 self._patroni.remove_raft_data()
                 logger.info(f"Stopping {self.unit.name}")
                 self.unit_peer_data["raft_stopped"] = "True"
-                self.watcher_offer.disable_watcher()
-                if self.watcher_offer.is_active:
+                self.watcher_handler.disable_watcher()
+                if self.watcher_handler.is_active:
                     logger.info("waiting for RAFT watcher to disconnect.")
                     return
 
@@ -1386,7 +1433,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         # In Raft mode with a watcher, ensure this member is properly registered in the DCS.
         # A new member may be running but not registered if it was added to Raft after starting.
         if (
-            self.watcher_offer.is_watcher_connected
+            self.watcher_handler.is_watcher_connected
             and not self.patroni_manager.is_member_registered_in_cluster()
         ):
             logger.info("Member running but not registered in Raft cluster - restarting Patroni")
@@ -1402,7 +1449,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         # Update watcher relation with fresh peer IPs when peer data changes
         # This ensures pg-endpoints stay current when unit IPs change
         if self.unit.is_leader():
-            self.watcher_offer.update_endpoints()
+            self.watcher_handler.update_endpoints()
             self.async_replication.update_async_replication_data()
 
         self._update_new_unit_status()
@@ -1472,7 +1519,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             self._update_relation_endpoints()
             self.async_replication.handle_read_only_mode()
             # Update watcher relation with current cluster endpoints
-            self.watcher_offer.update_endpoints()
+            self.watcher_handler.update_endpoints()
         else:
             self.set_unit_status(WaitingStatus(PRIMARY_NOT_REACHABLE_MESSAGE))
 
@@ -1516,9 +1563,9 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             self.patroni_manager.stop_patroni()
             self._update_certificate()
             # Update watcher relation - unit address for all units, endpoints only for leader
-            self.watcher_offer.update_unit_address()
+            self.watcher_handler.update_unit_address()
             if self.unit.is_leader():
-                self.watcher_offer.update_endpoints()
+                self.watcher_handler.update_endpoints()
             return True
         else:
             self.unit_peer_data.update({"ip-to-remove": ""})
@@ -1757,7 +1804,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             if val:
                 updates[key] = val
         self.unit_peer_data.update(updates)
-        self.watcher_offer.update_endpoints()
+        self.watcher_handler.update_endpoints()
 
     def _on_cluster_topology_change(self, _):
         """Updates endpoints and (optionally) certificates when the cluster topology changes."""
@@ -1776,7 +1823,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             or not self.is_cluster_initialised
             or self.state.unit_ip not in self.members_ips
             or self.has_raft_keys()
-            or (not self.members_ips and not self.watcher_offer.watcher_raft_address)
+            or (not self.members_ips and not self.watcher_handler.watcher_raft_address)
         ):
             return
 
@@ -1792,8 +1839,8 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         local_addr = f"{self.state.unit_ip}:{RAFT_PORT}"
         remote_addr = (
             watcher_addr
-            if (watcher_addr := self.watcher_offer.watcher_raft_address)
-            and self.watcher_offer.is_active
+            if (watcher_addr := self.watcher_handler.watcher_raft_address)
+            and self.watcher_handler.is_active
             else f"{next(member for member in self.members_ips if member != self.state.unit_ip)}:{RAFT_PORT}"
         )
         try:
@@ -2455,7 +2502,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         self._observer.start_observer()
 
         # Keep this unit data current for watcher AZ/IP checks.
-        self.watcher_offer.update_unit_address()
+        self.watcher_handler.update_unit_address()
 
         if self.unit.is_leader() and "refresh_remove_trigger" not in self.app_peer_data:
             self.postgresql.drop_hba_triggers()
@@ -2708,6 +2755,39 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         except snap.SnapError:
             logger.exception("Failed to stop charmed-postgresql snap services")
 
+    def _on_remove(self, _) -> None:
+        """Remove the charmed-postgresql snap on app teardown, before the machine goes away."""
+        # Juju only unmounts the storages after this hook, and snapd refuses to remove the
+        # snap while anything is mounted under its data directories, so unmount them here.
+        # The services were already stopped on storage-detaching, and unmounting leaves
+        # the storage contents untouched.
+        for name, storage in self.meta.storages.items():
+            if not storage.location:
+                continue
+            # `mountpoint` also detects bind mounts (unlike `os.path.ismount`), which is
+            # how Juju attaches rootfs storage.
+            if subprocess.run(["/usr/bin/mountpoint", "-q", storage.location]).returncode != 0:  # noqa: S603
+                continue
+            try:
+                subprocess.run(  # noqa: S603
+                    ["/usr/bin/umount", storage.location],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except subprocess.CalledProcessError as e:
+                logger.error(
+                    "Skipping charmed-postgresql snap removal: failed to unmount %s storage: %s",
+                    name,
+                    e.stderr,
+                )
+                return
+        try:
+            snap.SnapCache()[charm_refresh.snap_name()].ensure(snap.SnapState.Absent)
+        except (snap.SnapError, snap.SnapNotFoundError):
+            # Don't fail the hook: an error here would block the removal of the unit.
+            logger.exception("Failed to remove charmed-postgresql snap")
+
     def _is_storage_attached(self) -> bool:
         """Returns if storage is attached."""
         try:
@@ -2847,8 +2927,8 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             async_primary_cluster_endpoint=primary_cluster_endpoint,
             async_partner_addresses=self.async_replication.get_partner_addresses(),
             async_standby_endpoints=self.async_replication.get_standby_endpoints(),
-            watcher_raft_address=self.watcher_offer.watcher_raft_address
-            if self.watcher_offer.is_active
+            watcher_raft_address=self.watcher_handler.watcher_raft_address
+            if self.watcher_handler.is_active
             else None,
             no_peers=no_peers,
             refresh=refresh,
