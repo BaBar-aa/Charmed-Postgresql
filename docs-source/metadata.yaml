@@ -30,15 +30,17 @@ peers:
     interface: rolling_op
   refresh-v-three:
     interface: refresh
+  status-peers:
+    interface: status-peers
 
 provides:
   replication-offer:
     interface: postgresql_async
     limit: 1
     optional: true
-#   logical-replication-offer:
-#     interface: postgresql_logical_replication
-#     optional: true
+  logical-replication-offer:
+    interface: postgresql_logical_replication
+    optional: true
   database:
     interface: postgresql_client
   cos-agent:
@@ -59,10 +61,10 @@ requires:
     interface: tls-certificates
     limit: 1
     optional: true
-#   logical-replication:
-#     interface: postgresql_logical_replication
-#     limit: 1
-#     optional: true
+  logical-replication:
+    interface: postgresql_logical_replication
+    limit: 1
+    optional: true
   client-certificates:
     interface: tls-certificates
     limit: 1
